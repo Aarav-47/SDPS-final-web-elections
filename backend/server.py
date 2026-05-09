@@ -23,22 +23,28 @@ load_dotenv(ROOT_DIR / '.env')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Accept either MONGO_URL (preferred for Emergent) or MONGO_URI (Azure naming)
-MONGO_URL = os.environ.get('MONGO_URL') or os.environ.get('MONGO_URI')
-if not MONGO_URL:
-    raise RuntimeError("MONGO_URL (or MONGO_URI) environment variable is required")
+# Accept either MONGO_URL (preferred) or MONGO_URI (Azure Portal naming).
+# Falls back to the SDPS Atlas cluster so the app auto-connects on any deployment
+# without requiring env-var configuration. Override via Azure App Service settings
+# if you ever rotate the credentials.
+MONGO_URL = (
+    os.environ.get('MONGO_URL')
+    or os.environ.get('MONGO_URI')
+    or 'mongodb+srv://SDPS:SDPS@sdps-election-server.trpp58b.mongodb.net/?appName=SDPS-Election-Server'
+)
 
 DB_NAME = os.environ.get('DB_NAME', 'sdps-election')
-JWT_SECRET = os.environ.get('JWT_SECRET', 'sdps-election-secret-key-2026')
+JWT_SECRET = os.environ.get('JWT_SECRET', 'sdps-election-prod-secret-Krish2026-rotate-me')
 JWT_ALGO = 'HS256'
 
-# Async Mongo client (motor) — pooled, used for all queries
+# Async Mongo client (motor) — pooled, used for all queries.
+# retryWrites=True is the Atlas default and works out of the box.
+# (For Cosmos DB Mongo API, append &retrywrites=false to the URL itself.)
 client = AsyncIOMotorClient(
     MONGO_URL,
     serverSelectionTimeoutMS=10000,
     connectTimeoutMS=10000,
     maxPoolSize=50,
-    retryWrites=False,  # Cosmos DB Mongo API requires retryWrites=false
 )
 db = client[DB_NAME]
 
@@ -136,6 +142,26 @@ def slugify(s: str) -> str:
 async def active_post_keys() -> List[str]:
     docs = await db.posts.find({}, {"_id": 0}).sort("order", 1).to_list(1000)
     return [d["key"] for d in docs]
+
+
+PUBLIC_BACKEND_URL = os.environ.get(
+    'PUBLIC_BACKEND_URL',
+    'https://sdps-election-rg-d9cqbwakd4exb8d0.centralindia-01.azurewebsites.net',
+).rstrip('/')
+
+
+def _lighten_candidate(c: Dict) -> Dict:
+    """Replace heavy base64 data-URI photos with a lazy-loaded URL.
+    Keeps small HTTPS photo URLs as-is. Critical for /candidates and /bootstrap
+    response size on Azure (was 12 MB → ~5 KB)."""
+    out = dict(c)
+    photo = out.get("photo") or ""
+    if photo.startswith("data:"):
+        out["photo"] = f"{PUBLIC_BACKEND_URL}/api/candidates/{c['id']}/photo"
+    sym = out.get("symbol_image") or ""
+    if sym.startswith("data:"):
+        out["symbol_image"] = f"{PUBLIC_BACKEND_URL}/api/candidates/{c['id']}/symbol"
+    return out
 
 
 # ---------- Seeding & Indexes ----------
@@ -237,7 +263,43 @@ async def get_user(admission_no: str):
 @api.get("/candidates")
 async def get_candidates(post: Optional[str] = None):
     q = {"post": post} if post else {}
-    return await db.candidates.find(q, {"_id": 0}).to_list(1000)
+    docs = await db.candidates.find(q, {"_id": 0}).to_list(1000)
+    return [_lighten_candidate(c) for c in docs]
+
+@api.get("/candidates/{cid}/photo")
+async def get_candidate_photo(cid: str):
+    return await _stream_candidate_image(cid, "photo")
+
+
+@api.get("/candidates/{cid}/symbol")
+async def get_candidate_symbol(cid: str):
+    return await _stream_candidate_image(cid, "symbol_image")
+
+
+async def _stream_candidate_image(cid: str, field: str):
+    """Streams a (potentially huge base64) image only when needed.
+    Browser caches it for a day, so subsequent kiosk views are instant."""
+    c = await db.candidates.find_one({"id": cid}, {"_id": 0, field: 1})
+    if not c:
+        raise HTTPException(status_code=404, detail="Not found")
+    src = c.get(field) or ""
+    if not src:
+        raise HTTPException(status_code=404, detail="No image")
+    if src.startswith("data:"):
+        try:
+            header, b64 = src.split(",", 1)
+            mime = header.split(";")[0].replace("data:", "") or "image/jpeg"
+            import base64 as _b64
+            raw = _b64.b64decode(b64)
+            return StreamingResponse(
+                io.BytesIO(raw),
+                media_type=mime,
+                headers={"Cache-Control": "public, max-age=86400, immutable"},
+            )
+        except Exception:
+            raise HTTPException(status_code=500, detail="Invalid image data")
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(src, status_code=302)
 
 @api.get("/bootstrap")
 async def bootstrap():
@@ -251,7 +313,7 @@ async def bootstrap():
     )
     return {
         "posts": posts,
-        "candidates": cands,
+        "candidates": [_lighten_candidate(c) for c in cands],
         "settings": {d["key"]: d.get("value", "") for d in settings},
     }
 
@@ -501,7 +563,7 @@ async def create_candidate(body: CandidateCreate, _: str = Depends(verify_admin)
         raise HTTPException(status_code=400, detail="Invalid category")
     cand = Candidate(**body.model_dump())
     await db.candidates.insert_one(cand.model_dump())
-    return cand.model_dump()
+    return _lighten_candidate(cand.model_dump())
 
 @api.put("/admin/candidates/{cid}")
 async def update_candidate(cid: str, body: CandidateUpdate, _: str = Depends(verify_admin)):
@@ -513,7 +575,8 @@ async def update_candidate(cid: str, body: CandidateUpdate, _: str = Depends(ver
     res = await db.candidates.update_one({"id": cid}, {"$set": upd})
     if not res.matched_count:
         raise HTTPException(status_code=404, detail="Not found")
-    return await db.candidates.find_one({"id": cid}, {"_id": 0})
+    doc = await db.candidates.find_one({"id": cid}, {"_id": 0})
+    return _lighten_candidate(doc) if doc else None
 
 @api.delete("/admin/candidates/{cid}")
 async def delete_candidate(cid: str, _: str = Depends(verify_admin)):
@@ -583,9 +646,12 @@ async def public_results(_: str = Depends(verify_admin)):
     by_post = {p["key"]: [] for p in posts}
     for c in candidates:
         adj = int(c.get("adjustment") or 0)
+        photo = c.get("photo", "")
+        if photo.startswith("data:"):
+            photo = f"{PUBLIC_BACKEND_URL}/api/candidates/{c['id']}/photo"
         entry = {
             "candidate_id": c["id"], "name": c["name"],
-            "photo": c.get("photo", ""), "symbol": c.get("symbol", ""),
+            "photo": photo, "symbol": c.get("symbol", ""),
             "votes": counts.get(c["id"], 0) + adj,
         }
         if c["post"] in by_post:
@@ -624,9 +690,12 @@ async def stats(_: str = Depends(verify_admin)):
     for c in candidates:
         adj = int(c.get("adjustment") or 0)
         real = counts.get(c["id"], 0)
+        photo = c.get("photo", "")
+        if photo.startswith("data:"):
+            photo = f"{PUBLIC_BACKEND_URL}/api/candidates/{c['id']}/photo"
         entry = {
             "candidate_id": c["id"], "name": c["name"],
-            "photo": c.get("photo", ""), "symbol": c.get("symbol", ""),
+            "photo": photo, "symbol": c.get("symbol", ""),
             "real_votes": real, "adjustment": adj,
             "votes": real + adj,
         }
@@ -744,7 +813,10 @@ async def asyncio_gather_safe(*coros):
 # ---------- Wire up app ----------
 app.include_router(api)
 
-cors_origins_raw = os.environ.get('CORS_ORIGINS', '*')
+cors_origins_raw = os.environ.get(
+    'CORS_ORIGINS',
+    'https://sdps-election-web.vercel.app,http://localhost:3000',
+)
 cors_origins = [o.strip() for o in cors_origins_raw.split(',') if o.strip()] or ['*']
 app.add_middleware(
     CORSMiddleware,

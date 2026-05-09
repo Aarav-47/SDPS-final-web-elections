@@ -10,3 +10,17 @@ api.interceptors.request.use((config) => {
   if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 });
+
+/**
+ * Resolves a candidate photo URL.
+ * - Absolute URLs (https://, data:) → returned as-is.
+ * - Relative `/api/...` (lazy photo endpoint) → prefixed with BACKEND_URL.
+ * - Empty / missing → null (caller renders an initial-letter placeholder).
+ */
+export const photoUrl = (photo) => {
+  if (!photo) return null;
+  if (/^(https?:|data:)/i.test(photo)) return photo;
+  if (photo.startsWith("/")) return `${BACKEND_URL}${photo}`;
+  return photo;
+};
+

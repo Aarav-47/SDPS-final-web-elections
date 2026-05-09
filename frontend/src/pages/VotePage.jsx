@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
 import { KioskShell } from "../components/KioskShell";
 import { useVote } from "../context/VoteContext";
-import { api } from "../lib/api";
+import { api, photoUrl } from "../lib/api";
 import { toast } from "sonner";
 import { Check, ArrowRight, ArrowLeft, Award } from "lucide-react";
 
@@ -121,7 +121,7 @@ export default function VotePage() {
                 )}
                 <div className="flex items-start gap-4">
                   <div className="w-24 h-24 sm:w-28 sm:h-28 rounded-2xl overflow-hidden flex-shrink-0 bg-gradient-to-br from-blue-100 to-blue-200">
-                    {c.photo ? <img src={c.photo} alt={c.name} className="w-full h-full object-cover" />
+                    {c.photo ? <img src={photoUrl(c.photo)} alt={c.name} loading="lazy" decoding="async" className="w-full h-full object-cover" />
                       : <div className="w-full h-full flex items-center justify-center text-3xl font-bold text-[color:var(--sdps-blue)]">{c.name?.[0] || "?"}</div>}
                   </div>
                   <div className="flex-1 min-w-0">
@@ -129,7 +129,7 @@ export default function VotePage() {
                     <div className="font-display text-2xl font-bold leading-tight mt-1 truncate">{c.name}</div>
                     <div className="mt-3 flex items-center gap-2">
                       {c.symbol_image ? (
-                        <img src={c.symbol_image} alt={c.symbol} className="w-7 h-7 rounded-md object-cover" />
+                        <img src={photoUrl(c.symbol_image)} alt={c.symbol} loading="lazy" className="w-7 h-7 rounded-md object-cover" />
                       ) : (
                         <div className="w-7 h-7 rounded-md bg-gradient-to-br from-[#F3E5AB] to-[#D4AF37] flex items-center justify-center text-xs font-bold text-[color:var(--sdps-ink)]">
                           {(c.symbol || "?")[0]}

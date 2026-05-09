@@ -6,13 +6,8 @@
 ## Architecture
 - Frontend: React (CRA) deployed on **Vercel** at `https://sdps-election-web.vercel.app`
 - Backend: FastAPI (Python 3.11) on **Azure App Service Linux** at `https://sdps-election-rg-d9cqbwakd4exb8d0.centralindia-01.azurewebsites.net`
-- Database: **Azure Cosmos DB for MongoDB** API
-- Auth: JWT-based admin login (single seeded school admin)
-
-## User personas
-- **Voter (student/teacher)** — anonymous, kiosk-style flow on `/`, `/vote`, `/thank-you`.
-- **Public observer** — anonymous, sees only `/board` (turnout, no leaders).
-- **School admin** — authenticated, full control of users/candidates/categories/results/declaration.
+- Database: **MongoDB Atlas** (M0/M2 cluster) at `mongodb+srv://...sdps-election-server...mongodb.net`
+- Auth: JWT-based admin login (single seeded school admin, `Aarav` / `Krish@2026`)
 
 ## Public vs protected routes
 | Public                          | Protected (admin login required, with redirect-back) |
@@ -20,32 +15,31 @@
 | `/`, `/confirm`, `/vote`, `/thank-you`, `/board`, `/admin/login` | `/results`, `/admin`, `/admin/declaration` |
 
 ## Implemented (2026-05-09)
-- **Fixed critical bug**: `backend/server.py` was completely duplicated (1396 → 767 lines). First copy used undefined `MongoClient` (silent crash in try/except), second copy was the real app. Removed duplication, single clean motor-based async Mongo client.
-- **Fixed slow per-category load** (was 30 s for 2nd/3rd/4th category):
-  - Added `/api/bootstrap` endpoint → returns posts + candidates + settings in 1 round-trip.
-  - VotePage now pre-fetches all candidates **once** and slices by category in memory (zero per-step latency).
-  - Added MongoDB indexes on `admission_no`, `votes.admission_no`, `candidates.post`, `posts.key`, `admins.username`, `settings.key` via `ensure_indexes()` startup hook.
-  - Bulk candidate validation in `/api/votes` (1 query instead of N).
-- **Auth wall + redirect**:
-  - New `RequireAdmin` HOC wraps `/results`, `/admin`, `/admin/declaration`.
-  - Anonymous users → redirected to `/admin/login?redirect=<original-path>`.
-  - After login, AdminLogin reads `?redirect=` and navigates back to the requested page.
-  - Backend `/api/results` is now admin-protected too (token required).
-- **Deployment configs**:
-  - `frontend/vercel.json` — SPA rewrites + asset cache headers.
-  - `frontend/.env.example`, `backend/.env.example` — documented env vars.
-  - `DEPLOYMENT.md` — step-by-step Vercel + Azure + Cosmos DB guide.
-- **Speed-up tips** documented in `DEPLOYMENT.md`: Always On, region co-location, RU autoscale, indexes, gunicorn keep-alive, Front Door optional.
-- **Backwards compat**: `MONGO_URL` is preferred but `MONGO_URI` (Azure Portal naming) still works.
+- **Fixed critical bug**: `backend/server.py` was completely duplicated (1396 → ~850 lines). First copy used undefined `MongoClient` (silent crash in try/except), second copy was the real app. Removed duplication.
+- **MongoDB Atlas wired in** as a built-in default in `server.py` — backend auto-connects with **zero env-var config** on Azure.
+- **Real root cause of 30-second category lag identified and fixed**: candidate photos were stored as **base64 data-URIs** inside Mongo docs, making `/api/candidates` 12 MB.
+  - New `_lighten_candidate()` strips data-URIs in list responses, replacing with lazy URLs.
+  - New `/api/candidates/{id}/photo` and `/api/candidates/{id}/symbol` stream image bytes with `Cache-Control: public, max-age=86400, immutable` (1-day browser cache).
+  - `/api/bootstrap` response dropped from **12.6 MB → ~5 KB** (2,500× smaller).
+- **One-shot kiosk load**: `/api/bootstrap` returns posts + lightweight candidates + settings in a single round-trip; `VotePage` pre-fetches once → category navigation is instant.
+- **MongoDB indexes** via `ensure_indexes()` on `users.admission_no`, `votes.admission_no`, `candidates.id` & `candidates.post`, `posts.key`, `admins.username`, `settings.key`.
+- **Auth wall + redirect-back**: `RequireAdmin` HOC guards `/results`, `/admin`, `/admin/declaration`; backend `/api/results` requires admin token.
+- **Lazy images** (`loading="lazy" decoding="async"`) on candidate cards.
+- Added `dnspython` for `mongodb+srv://` URLs.
+- CORS default allows `https://sdps-election-web.vercel.app` + `http://localhost:3000`.
+- Created `frontend/vercel.json`, `frontend/.env.example`, `backend/.env.example`, `DEPLOYMENT.md`.
 
-## Backlog / Next action items
-- [P1] Push the updated repo to GitHub → Vercel re-deploys frontend automatically; Azure picks up the new `server.py` after a deployment trigger.
-- [P1] In Azure Portal → App Service → Configuration: set `JWT_SECRET`, confirm `MONGO_URL` (or rename `MONGO_URI` → `MONGO_URL`), set `CORS_ORIGINS=https://sdps-election-web.vercel.app`, enable **Always On**, then **Restart**.
-- [P1] In Vercel: confirm `REACT_APP_BACKEND_URL` matches the Azure URL **without a trailing slash**.
-- [P2] Add health-check ping path `/api/health` to Azure (already implemented in code).
-- [P2] Consider Azure Front Door for global edge / auto-warming.
-- [P3] Audit log for vote-edit / vote-delete by admin (compliance).
-- [P3] Stronger admin password policy + rotate seeded password on first login.
+## Action items for the user
+1. **Push to GitHub** (`git add . && git commit -m "speed+auth fixes" && git push`) → Vercel and Azure auto-redeploy.
+2. In **Vercel → Project → Environment Variables**, confirm `REACT_APP_BACKEND_URL` = `https://sdps-election-rg-d9cqbwakd4exb8d0.centralindia-01.azurewebsites.net` (no trailing slash, no `/api`). Click **Redeploy**.
+3. In **Azure App Service → Configuration**, enable **Always On** (Settings → General settings) to eliminate cold starts.
 
-## Smart enhancement idea
-For election day, add a lightweight **public live ticker** on `/board` (already turnout-only) that pushes a confetti animation each time a vote is cast — keeps voters engaged in the queue and increases word-of-mouth turnout without leaking any candidate-level data. Tiny socket.io or Server-Sent-Events on `/api/board/stream` would do it.
+## Backlog
+- [P2] Server-side photo thumbnail generation (Pillow) on upload to keep DB lean.
+- [P2] Audit log for admin vote-edit / vote-delete (compliance).
+- [P3] Self-service "change admin password" endpoint.
+- [P3] Azure Front Door for global edge caching.
+- [P3] Live confetti ticker on `/board` (turnout-only SSE) for engagement on election day.
+
+## Smart enhancement
+On election day, why not add a **live confetti pulse** on `/board` every time a ballot is cast (turnout-only, results-safe) via tiny SSE on `/api/board/stream`? Keeps the queue engaged, drives turnout via word-of-mouth.
