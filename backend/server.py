@@ -152,16 +152,67 @@ PUBLIC_BACKEND_URL = os.environ.get(
 
 def _lighten_candidate(c: Dict) -> Dict:
     """Replace heavy base64 data-URI photos with a lazy-loaded URL.
-    Keeps small HTTPS photo URLs as-is. Critical for /candidates and /bootstrap
-    response size on Azure (was 12 MB → ~5 KB)."""
+    NOTE: pair this with the LIGHT_CANDIDATE_PROJECTION below — the Mongo
+    query must already exclude the heavy fields, and we add URL stubs here.
+    """
     out = dict(c)
-    photo = out.get("photo") or ""
-    if photo.startswith("data:"):
+    if out.pop("_photo_is_data", False):
         out["photo"] = f"{PUBLIC_BACKEND_URL}/api/candidates/{c['id']}/photo"
-    sym = out.get("symbol_image") or ""
-    if sym.startswith("data:"):
+    if out.pop("_symbol_is_data", False):
         out["symbol_image"] = f"{PUBLIC_BACKEND_URL}/api/candidates/{c['id']}/symbol"
     return out
+
+
+# Mongo aggregation pipeline that returns candidates WITHOUT the heavy
+# photo/symbol_image bytes when they are base64 data-URIs, but keeps short
+# https URLs intact. Result docs include `_photo_is_data` / `_symbol_is_data`
+# booleans for the API layer to synthesize URLs.
+LIGHT_CANDIDATE_PIPELINE = [
+    {"$project": {
+        "_id": 0,
+        "id": 1,
+        "post": 1,
+        "name": 1,
+        "symbol": 1,
+        "adjustment": 1,
+        "_photo_is_data": {
+            "$cond": [
+                {"$eq": [{"$substrCP": [{"$ifNull": ["$photo", ""]}, 0, 5]}, "data:"]},
+                True, False,
+            ]
+        },
+        "photo": {
+            "$cond": [
+                {"$eq": [{"$substrCP": [{"$ifNull": ["$photo", ""]}, 0, 5]}, "data:"]},
+                "",
+                {"$ifNull": ["$photo", ""]},
+            ]
+        },
+        "_symbol_is_data": {
+            "$cond": [
+                {"$eq": [{"$substrCP": [{"$ifNull": ["$symbol_image", ""]}, 0, 5]}, "data:"]},
+                True, False,
+            ]
+        },
+        "symbol_image": {
+            "$cond": [
+                {"$eq": [{"$substrCP": [{"$ifNull": ["$symbol_image", ""]}, 0, 5]}, "data:"]},
+                "",
+                {"$ifNull": ["$symbol_image", ""]},
+            ]
+        },
+    }}
+]
+
+
+async def fetch_light_candidates(filter_q: Optional[Dict] = None) -> List[Dict]:
+    """One Mongo round-trip that returns small candidate docs (no base64 bytes
+    over the wire). Use this everywhere instead of `db.candidates.find({})`."""
+    pipeline = list(LIGHT_CANDIDATE_PIPELINE)
+    if filter_q:
+        pipeline.insert(0, {"$match": filter_q})
+    docs = await db.candidates.aggregate(pipeline).to_list(2000)
+    return [_lighten_candidate(d) for d in docs]
 
 
 # ---------- Seeding & Indexes ----------
@@ -242,14 +293,51 @@ async def root():
 async def health():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 
+def _light_settings(docs: List[Dict]) -> Dict[str, str]:
+    """Replace base64 setting values (e.g. school_logo) with a streaming URL.
+    Keeps small string values intact."""
+    out = {}
+    for d in docs:
+        v = d.get("value", "")
+        if isinstance(v, str) and v.startswith("data:"):
+            out[d["key"]] = f"{PUBLIC_BACKEND_URL}/api/settings/{d['key']}/asset"
+        else:
+            out[d["key"]] = v
+    return out
+
+
 @api.get("/posts")
 async def list_posts():
     return await db.posts.find({}, {"_id": 0}).sort("order", 1).to_list(1000)
 
 @api.get("/settings")
 async def get_public_settings():
-    docs = await db.settings.find({}, {"_id": 0}).to_list(100)
-    return {d["key"]: d.get("value", "") for d in docs}
+    # Project out heavy values, then synthesize streaming URLs for base64 ones.
+    docs = await db.settings.find({}, {"_id": 0, "key": 1, "value": 1}).to_list(100)
+    return _light_settings(docs)
+
+@api.get("/settings/{key}/asset")
+async def stream_setting_asset(key: str):
+    """Stream a base64 setting (school_logo, etc.) as a real image.
+    Allows aggressive browser caching so the kiosk loads it once per day."""
+    s = await db.settings.find_one({"key": key}, {"_id": 0, "value": 1})
+    if not s:
+        raise HTTPException(status_code=404, detail="Setting not found")
+    v = s.get("value", "") or ""
+    if not v.startswith("data:"):
+        raise HTTPException(status_code=404, detail="Not a binary setting")
+    try:
+        header, b64 = v.split(",", 1)
+        mime = header.split(";")[0].replace("data:", "") or "image/png"
+        import base64 as _b64
+        raw = _b64.b64decode(b64)
+        return StreamingResponse(
+            io.BytesIO(raw),
+            media_type=mime,
+            headers={"Cache-Control": "public, max-age=86400, immutable"},
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="Invalid asset")
 
 @api.get("/users/{admission_no}")
 async def get_user(admission_no: str):
@@ -262,9 +350,7 @@ async def get_user(admission_no: str):
 
 @api.get("/candidates")
 async def get_candidates(post: Optional[str] = None):
-    q = {"post": post} if post else {}
-    docs = await db.candidates.find(q, {"_id": 0}).to_list(1000)
-    return [_lighten_candidate(c) for c in docs]
+    return await fetch_light_candidates({"post": post} if post else None)
 
 @api.get("/candidates/{cid}/photo")
 async def get_candidate_photo(cid: str):
@@ -308,13 +394,13 @@ async def bootstrap():
     N per-category fetches from the kiosk."""
     posts, cands, settings = await asyncio_gather_safe(
         db.posts.find({}, {"_id": 0}).sort("order", 1).to_list(1000),
-        db.candidates.find({}, {"_id": 0}).to_list(2000),
-        db.settings.find({}, {"_id": 0}).to_list(100),
+        fetch_light_candidates(),
+        db.settings.find({}, {"_id": 0, "key": 1, "value": 1}).to_list(100),
     )
     return {
         "posts": posts,
-        "candidates": [_lighten_candidate(c) for c in cands],
-        "settings": {d["key"]: d.get("value", "") for d in settings},
+        "candidates": cands,
+        "settings": _light_settings(settings),
     }
 
 @api.post("/votes")
@@ -634,7 +720,7 @@ async def public_board():
 @api.get("/results")
 async def public_results(_: str = Depends(verify_admin)):
     posts = await db.posts.find({}, {"_id": 0}).sort("order", 1).to_list(1000)
-    candidates = await db.candidates.find({}, {"_id": 0}).to_list(2000)
+    candidates = await fetch_light_candidates()
     votes = await db.votes.find({}, {"_id": 0, "selections": 1, "voter_class": 1, "admission_no": 1}).to_list(30000)
     total_users = await db.users.count_documents({})
 
@@ -646,12 +732,9 @@ async def public_results(_: str = Depends(verify_admin)):
     by_post = {p["key"]: [] for p in posts}
     for c in candidates:
         adj = int(c.get("adjustment") or 0)
-        photo = c.get("photo", "")
-        if photo.startswith("data:"):
-            photo = f"{PUBLIC_BACKEND_URL}/api/candidates/{c['id']}/photo"
         entry = {
             "candidate_id": c["id"], "name": c["name"],
-            "photo": photo, "symbol": c.get("symbol", ""),
+            "photo": c.get("photo", ""), "symbol": c.get("symbol", ""),
             "votes": counts.get(c["id"], 0) + adj,
         }
         if c["post"] in by_post:
@@ -675,7 +758,7 @@ async def public_results(_: str = Depends(verify_admin)):
 async def stats(_: str = Depends(verify_admin)):
     posts = await db.posts.find({}, {"_id": 0}).sort("order", 1).to_list(1000)
     post_keys = [p["key"] for p in posts]
-    candidates = await db.candidates.find({}, {"_id": 0}).to_list(2000)
+    candidates = await fetch_light_candidates()
     cand_map = {c["id"]: c for c in candidates}
     votes = await db.votes.find({}, {"_id": 0}).to_list(30000)
     total_users = await db.users.count_documents({})
@@ -690,12 +773,9 @@ async def stats(_: str = Depends(verify_admin)):
     for c in candidates:
         adj = int(c.get("adjustment") or 0)
         real = counts.get(c["id"], 0)
-        photo = c.get("photo", "")
-        if photo.startswith("data:"):
-            photo = f"{PUBLIC_BACKEND_URL}/api/candidates/{c['id']}/photo"
         entry = {
             "candidate_id": c["id"], "name": c["name"],
-            "photo": photo, "symbol": c.get("symbol", ""),
+            "photo": c.get("photo", ""), "symbol": c.get("symbol", ""),
             "real_votes": real, "adjustment": adj,
             "votes": real + adj,
         }
@@ -776,8 +856,8 @@ async def delete_vote(vote_id: str, _: str = Depends(verify_admin)):
 # ---------- Admin: Settings ----------
 @api.get("/admin/settings")
 async def admin_settings(_: str = Depends(verify_admin)):
-    docs = await db.settings.find({}, {"_id": 0}).to_list(100)
-    return {d["key"]: d.get("value", "") for d in docs}
+    docs = await db.settings.find({}, {"_id": 0, "key": 1, "value": 1}).to_list(100)
+    return _light_settings(docs)
 
 @api.put("/admin/settings/{key}")
 async def update_setting(key: str, body: SettingValue, _: str = Depends(verify_admin)):
