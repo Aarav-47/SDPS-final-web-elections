@@ -10,32 +10,32 @@ export default function VotePage() {
   const { student, selections, setSelections, stepIndex, setStepIndex } = useVote();
   const navigate = useNavigate();
   const [posts, setPosts] = useState([]);
-  const [candidates, setCandidates] = useState([]);
+  const [allCandidates, setAllCandidates] = useState([]);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
 
+  // Single round-trip on mount: posts + all candidates pre-loaded.
+  // Eliminates the 30s-per-category lag caused by serial Cosmos queries.
   useEffect(() => {
     if (!student) return;
-    api.get("/posts")
-      .then(({ data }) => setPosts(data))
-      .catch(() => toast.error("Failed to load categories"));
+    let active = true;
+    setLoading(true);
+    api.get("/bootstrap")
+      .then(({ data }) => {
+        if (!active) return;
+        setPosts(data.posts || []);
+        setAllCandidates(data.candidates || []);
+      })
+      .catch(() => toast.error("Failed to load ballot. Please try again."))
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
   }, [student]);
 
   const post = posts[stepIndex];
   const total = posts.length;
   const progressPct = total ? Math.round((stepIndex / total) * 100) : 0;
   const selected = post ? selections?.[post.key] : null;
-
-  useEffect(() => {
-    if (!student || !post) return;
-    let active = true;
-    setLoading(true);
-    api.get(`/candidates`, { params: { post: post.key } })
-      .then(({ data }) => { if (active) setCandidates(data); })
-      .catch(() => toast.error("Failed to load candidates"))
-      .finally(() => { if (active) setLoading(false); });
-    return () => { active = false; };
-  }, [post, student]);
+  const candidates = post ? allCandidates.filter(c => c.post === post.key) : [];
 
   if (!student) return <Navigate to="/" replace />;
 

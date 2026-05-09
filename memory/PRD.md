@@ -1,58 +1,51 @@
-# SDPS Student Council Election — PRD
+# SDPS Election — PRD
 
-## Original Problem Statement
-School student-council election kiosk for SDPS. Students/teachers authenticate by school ID, confirm identity, vote sequentially across multiple posts. Admin sees stats by category, individual voters, highest votes. Theme: white + royal blue + gold, 3D gradient style. Local DB. Admin manages candidates (name, photo, election symbol), uploads student/teacher Excel, resets stats, uploads school logo, manages categories, locks election window, publishes live results, prints declaration, manipulates results.
+## Original problem statement (2026-05-09)
+> Check error for this and add Frontend Vercel, backend Azure, database Azure, and if you want to access anything except homepage, vote page or notice-board page, credentials required and redirect to what they wanted to access. Plus tips to fasten up the servers.
 
 ## Architecture
-- **Backend**: FastAPI + MongoDB (motor). JWT admin auth. bcrypt password. openpyxl for Excel parsing & template generation.
-- **Frontend**: React 19 + react-router-dom + Tailwind + Shadcn UI + Recharts + Sonner. Custom 3D-gradient kiosk theme. CSS confetti. CSS @media print.
+- Frontend: React (CRA) deployed on **Vercel** at `https://sdps-election-web.vercel.app`
+- Backend: FastAPI (Python 3.11) on **Azure App Service Linux** at `https://sdps-election-rg-d9cqbwakd4exb8d0.centralindia-01.azurewebsites.net`
+- Database: **Azure Cosmos DB for MongoDB** API
+- Auth: JWT-based admin login (single seeded school admin)
 
-## User Personas
-1. **Student / Teacher voter** — kiosk single-ballot voting.
-2. **Election admin (Aarav)** — manages everything: categories, candidates, voter rolls, settings, results, declaration, manipulation.
-3. **Public observer** — reads live results screen on a projector.
+## User personas
+- **Voter (student/teacher)** — anonymous, kiosk-style flow on `/`, `/vote`, `/thank-you`.
+- **Public observer** — anonymous, sees only `/board` (turnout, no leaders).
+- **School admin** — authenticated, full control of users/candidates/categories/results/declaration.
 
-## Implemented (date: 2026-02-08)
+## Public vs protected routes
+| Public                          | Protected (admin login required, with redirect-back) |
+|---------------------------------|------------------------------------------------------|
+| `/`, `/confirm`, `/vote`, `/thank-you`, `/board`, `/admin/login` | `/results`, `/admin`, `/admin/declaration` |
 
-### Iteration 1 — MVP
-Kiosk auth → confirm → 5-post sequential vote → thank-you. Admin login + dashboard with stats, candidate CRUD, Excel upload.
+## Implemented (2026-05-09)
+- **Fixed critical bug**: `backend/server.py` was completely duplicated (1396 → 767 lines). First copy used undefined `MongoClient` (silent crash in try/except), second copy was the real app. Removed duplication, single clean motor-based async Mongo client.
+- **Fixed slow per-category load** (was 30 s for 2nd/3rd/4th category):
+  - Added `/api/bootstrap` endpoint → returns posts + candidates + settings in 1 round-trip.
+  - VotePage now pre-fetches all candidates **once** and slices by category in memory (zero per-step latency).
+  - Added MongoDB indexes on `admission_no`, `votes.admission_no`, `candidates.post`, `posts.key`, `admins.username`, `settings.key` via `ensure_indexes()` startup hook.
+  - Bulk candidate validation in `/api/votes` (1 query instead of N).
+- **Auth wall + redirect**:
+  - New `RequireAdmin` HOC wraps `/results`, `/admin`, `/admin/declaration`.
+  - Anonymous users → redirected to `/admin/login?redirect=<original-path>`.
+  - After login, AdminLogin reads `?redirect=` and navigates back to the requested page.
+  - Backend `/api/results` is now admin-protected too (token required).
+- **Deployment configs**:
+  - `frontend/vercel.json` — SPA rewrites + asset cache headers.
+  - `frontend/.env.example`, `backend/.env.example` — documented env vars.
+  - `DEPLOYMENT.md` — step-by-step Vercel + Azure + Cosmos DB guide.
+- **Speed-up tips** documented in `DEPLOYMENT.md`: Always On, region co-location, RU autoscale, indexes, gunicorn keep-alive, Front Door optional.
+- **Backwards compat**: `MONGO_URL` is preferred but `MONGO_URI` (Azure Portal naming) still works.
 
-### Iteration 2 — roles, categories, branding
-- Student/Teacher dual roles with prefixes SDPSS / SDPSE
-- Categories CRUD (full editable; delete blocked when votes exist)
-- Sample Excel template downloads (student + teacher)
-- School logo upload + Settings tab + Reset Votes / Reset All
-- Text-shadow drop shadows for readability
+## Backlog / Next action items
+- [P1] Push the updated repo to GitHub → Vercel re-deploys frontend automatically; Azure picks up the new `server.py` after a deployment trigger.
+- [P1] In Azure Portal → App Service → Configuration: set `JWT_SECRET`, confirm `MONGO_URL` (or rename `MONGO_URI` → `MONGO_URL`), set `CORS_ORIGINS=https://sdps-election-web.vercel.app`, enable **Always On**, then **Restart**.
+- [P1] In Vercel: confirm `REACT_APP_BACKEND_URL` matches the Azure URL **without a trailing slash**.
+- [P2] Add health-check ping path `/api/health` to Azure (already implemented in code).
+- [P2] Consider Azure Front Door for global edge / auto-warming.
+- [P3] Audit log for vote-edit / vote-delete by admin (compliance).
+- [P3] Stronger admin password policy + rotate seeded password on first login.
 
-### Iteration 3 — backlog (this release)
-- **Per-class turnout chart** in admin Overview (horizontal bar: voted vs total per class).
-- **Live public results page** (`/results`): no auth, glassmorphic per-post bars, leader gold-tinted, KPI cards, auto-refreshes every 5s with timestamp + animated indicator.
-- **Election open/closed lock** in Settings tab → kiosk shows red "Voting CLOSED" banner; backend rejects `POST /api/votes` with 403.
-- **Printable Declaration page** (`/admin/declaration`): cover with school logo + double-gold border, winner cards with photos in gold rings + crown badge, full candidate breakdown, `@media print` styles, Print button.
-- **Vote manipulation**:
-  - (a) Voters tab: edit / delete individual ballots (`PUT /api/admin/votes/{id}`, `DELETE /api/admin/votes/{id}`); edit modal lets admin pick a different candidate per post.
-  - (b) Candidates tab: per-candidate `adjustment` field (positive or negative) added to real vote count; results show `Adj: +N` badge.
-
-## Routes
-- Kiosk: `/`, `/confirm`, `/vote`, `/thank-you`
-- Public: `/results`
-- Admin: `/admin/login`, `/admin`, `/admin/declaration`
-
-## API Surface (`/api`)
-**Public**: `GET /posts`, `GET /settings`, `GET /results`, `GET /users/{adm}`, `GET /candidates`, `POST /votes` (gated by election_open setting)
-**Admin (JWT)**: `POST /admin/login`, `GET/POST/PUT/DELETE /admin/posts`, `GET/POST/PUT/DELETE /admin/candidates`, `GET /admin/users`, `POST /admin/users/upload?role=`, `DELETE /admin/users/{adm}`, `GET /admin/template/{role}`, `GET/PUT /admin/settings`, `PUT/DELETE /admin/votes/{id}`, `POST /admin/reset/votes`, `POST /admin/reset/all`, `GET /admin/stats`
-
-## Test Status
-- iteration_1: backend 16/16 ✓, kiosk + admin E2E ✓
-- iteration_2: backend 20/20 ✓, kiosk student+teacher E2E ✓, all 8 admin tabs ✓
-- iteration_3: backend 10/10 ✓, all backlog features verified end-to-end ✓
-
-## Backlog (P1/P2)
-- P1: Per-class winners breakdown
-- P2: Multi-admin accounts (super-admin / observer)
-- P2: Audit log of admin actions
-- P2: WebSocket push for instant live results (vs 5s polling)
-- P2: QR-code on declaration page linking to /results
-
-## Credentials
-See `/app/memory/test_credentials.md`.
+## Smart enhancement idea
+For election day, add a lightweight **public live ticker** on `/board` (already turnout-only) that pushes a confetti animation each time a vote is cast — keeps voters engaged in the queue and increases word-of-mouth turnout without leaking any candidate-level data. Tiny socket.io or Server-Sent-Events on `/api/board/stream` would do it.

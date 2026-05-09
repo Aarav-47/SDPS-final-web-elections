@@ -11,21 +11,25 @@ import AdminDashboard from "./pages/AdminDashboard";
 import LiveResults from "./pages/LiveResults";
 import Declaration from "./pages/Declaration";
 import NoticeBoard from "./pages/NoticeBoard";
+import RequireAdmin from "./components/RequireAdmin";
 
 export default function App() {
   return (
     <BrowserRouter>
       <VoteProvider>
         <Routes>
+          {/* Public — no auth required */}
           <Route path="/" element={<AuthPage />} />
           <Route path="/confirm" element={<ConfirmPage />} />
           <Route path="/vote" element={<VotePage />} />
           <Route path="/thank-you" element={<ThankYouPage />} />
-          <Route path="/results" element={<LiveResults />} />
           <Route path="/board" element={<NoticeBoard />} />
           <Route path="/admin/login" element={<AdminLogin />} />
-          <Route path="/admin" element={<AdminDashboard />} />
-          <Route path="/admin/declaration" element={<Declaration />} />
+
+          {/* Protected — admin login required, redirects back after login */}
+          <Route path="/results" element={<RequireAdmin><LiveResults /></RequireAdmin>} />
+          <Route path="/admin" element={<RequireAdmin><AdminDashboard /></RequireAdmin>} />
+          <Route path="/admin/declaration" element={<RequireAdmin><Declaration /></RequireAdmin>} />
         </Routes>
         <Toaster position="top-center" richColors closeButton />
       </VoteProvider>
